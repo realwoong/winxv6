@@ -32,27 +32,24 @@ seginit(void)
 // Return the address of the PTE in page table pgdir
 // that corresponds to virtual address va.  If alloc!=0,
 // create any required page table pages.
-static pte_t *
+pte_t *
 walkpgdir(pde_t *pgdir, const void *va, int alloc)
 {
   pde_t *pde;
   pte_t *pgtab;
 
-  pde = &pgdir[PDX(va)];
-  if(*pde & PTE_P){
-    pgtab = (pte_t*)P2V(PTE_ADDR(*pde));
-  } else {
-    if(!alloc || (pgtab = (pte_t*)kalloc()) == 0)
-      return 0;
-    // Make sure all those PTE_P bits are zero.
-    memset(pgtab, 0, PGSIZE);
-    // The permissions here are overly generous, but they can
-    // be further restricted by the permissions in the page table
-    // entries, if necessary.
-    *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U;
+  pde = &pgdir[PDX(va)]; // 주어진 가상 주소 va에 대한 페이지 디렉토리 엔트리를 가져옴
+  if(*pde & PTE_P){ // 페이지 디렉토리 엔트리가 유효한지 확인
+    pgtab = (pte_t*)P2V(PTE_ADDR(*pde)); // 페이지 디렉토리 엔트리에서 페이지 테이블의 물리 주소를 가져와 가상 주소로 변환
+  } else { // 페이지 디렉토리 엔트리가 유효하지 않은 경우
+    if(!alloc || (pgtab = (pte_t*)kalloc()) == 0) // alloc이 0이거나 페이지 테이블을 위한 메모리 할당에 실패한 경우
+      return 0; // NULL 반환
+    memset(pgtab, 0, PGSIZE); // 새로 할당된 페이지 테이블을 0으로 초기화
+    *pde = V2P(pgtab) | PTE_P | PTE_W | PTE_U; // 페이지 디렉토리 엔트리를 페이지 테이블의 물리 주소와 플래그로 설정
   }
-  return &pgtab[PTX(va)];
+  return &pgtab[PTX(va)]; // 주어진 가상 주소 va에 대한 페이지 테이블 엔트리를 반환
 }
+
 
 // Create PTEs for virtual addresses starting at va that refer to
 // physical addresses starting at pa. va and size might not
@@ -312,37 +309,64 @@ clearpteu(pde_t *pgdir, char *uva)
 
 // Given a parent process's page table, create a copy
 // of it for a child.
+
+
+
+void swap_in_page(struct page *page);
+//원본 copyuvm
+
 pde_t*
 copyuvm(pde_t *pgdir, uint sz)
 {
-  pde_t *d;
-  pte_t *pte;
-  uint pa, i, flags;
-  char *mem;
+  pde_t *d; // 새 페이지 디렉토리 포인터
+  pte_t *pte; // 페이지 테이블 엔트리 포인터
+  uint pa, i, flags; // 물리 주소, 인덱스, 플래그 변수
+  char *mem; // 새로운 물리 메모리 페이지 포인터
 
-  if((d = setupkvm()) == 0)
-    return 0;
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
-      panic("copyuvm: pte should exist");
-    if(!(*pte & PTE_P))
-      panic("copyuvm: page not present");
-    pa = PTE_ADDR(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char*)P2V(pa), PGSIZE);
-    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) {
-      kfree(mem);
-      goto bad;
+  if((d = setupkvm()) == 0) // 새로운 커널 페이지 테이블 설정
+    return 0; // 실패 시 0 반환
+  
+  for(i = 0; i < sz; i += PGSIZE){ // 가상 메모리 크기만큼 페이지 단위로 반복
+    if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0) // 페이지 테이블 엔트리 가져오기
+      panic("copyuvm: pte should exist"); // PTE가 존재하지 않으면 패닉
+
+    if(*pte & PTE_SWAP) { // 페이지가 스왑된 경우
+      struct page temp_page;
+      temp_page.pgdir = pgdir;
+      temp_page.vaddr = (char *)i;
+
+      swap_in_page(&temp_page); // 페이지를 다시 메모리로 로드
+      pte = walkpgdir(pgdir, (void *) i, 0); // 다시 PTE를 가져옴
+
+      if(!pte || !(*pte & PTE_P)) // 페이지가 여전히 존재하지 않는 경우
+        panic("copyuvm: failed to swap in"); // 패닉
+    }
+
+    if(!(*pte & PTE_P)) // 페이지가 존재하지 않는 경우
+      panic("copyuvm: page not present"); // 패닉
+
+    pa = PTE_ADDR(*pte); // 물리 주소 추출
+    flags = PTE_FLAGS(*pte); // PTE 플래그 추출
+
+    if((mem = kalloc()) == 0) // 새로운 물리 메모리 페이지 할당
+      goto bad; // 실패 시 bad로 이동
+
+    memmove(mem, (char*)P2V(pa), PGSIZE); // 할당된 페이지로 메모리 복사
+
+    if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0) { // 새 페이지 디렉토리에 매핑
+      kfree(mem); // 실패 시 할당된 메모리 해제
+      goto bad; // bad로 이동
     }
   }
-  return d;
+  return d; // 성공 시 새로운 페이지 디렉토리 반환
 
 bad:
-  freevm(d);
-  return 0;
+  freevm(d); // 실패 시 할당된 페이지 디렉토리 해제
+  return 0; // 0 반환
 }
+
+
+
 
 //PAGEBREAK!
 // Map user virtual address to kernel address.
